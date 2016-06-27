@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -64,35 +65,22 @@ func (of *OCIFetcher) debugMsg(format string, a ...interface{}) {
 }
 
 func blobsDir(outputDir string) string {
-	return path.Join(outputDir, "blobs")
+	return filepath.Join(outputDir, "blobs")
 }
 
 func blobFile(outputDir string, digest string) string {
 	formattedDigest := strings.Replace(digest, ":", "-", -1)
-	return path.Join(blobsDir(outputDir), formattedDigest)
+	return filepath.Join(blobsDir(outputDir), formattedDigest)
 }
 
 func refsDir(outputDir string) string {
-	return path.Join(outputDir, "refs")
+	return filepath.Join(outputDir, "refs")
 }
 
 // Fetch will download the image represented by u into outputDir.
 func (of *OCIFetcher) Fetch(u *URL, outputDir string) error {
-	// fetch the manifest and config
-	of.debugMsg("fetching OCI image host:%s, name:%s, tag:%s", u.Host, u.Name, u.Version)
-	manifest, err := of.fetchManifest(u)
-	if err != nil {
-		return err
-	}
-	of.debugMsg("manifest successfully retrieved")
-	config, err := of.fetchConfig(u, manifest.Config.Digest, manifest.Config.Size)
-	if err != nil {
-		return err
-	}
-	of.debugMsg("config successfully retrieved")
-
 	// create the blobs and refs directories
-	err = os.MkdirAll(blobsDir(outputDir), 0755)
+	err := os.MkdirAll(blobsDir(outputDir), 0755)
 	if err != nil {
 		return err
 	}
@@ -101,9 +89,24 @@ func (of *OCIFetcher) Fetch(u *URL, outputDir string) error {
 		return err
 	}
 
+	// fetch the manifest and config
+	of.debugMsg("fetching OCI image host:%s, name:%s, tag:%s", u.Host, u.Name, u.Version)
+	manifestData, err := of.fetchManifest(u, outputDir)
+	if err != nil {
+		return err
+	}
+	manifest := manifestData.manifest
+	of.debugMsg("manifest successfully retrieved")
+
+	configData, err := of.fetchConfig(u, manifest.Config.Digest, manifest.Config.Size, outputDir)
+	if err != nil {
+		return err
+	}
+	of.debugMsg("config successfully retrieved")
+
 	// download all of the layers into the blobs directory, displaying progress
 	// bars for the user
-	cpp := &progressutil.CopyProgressPrinter{}
+	cpp := progressutil.NewCopyProgressPrinter()
 	layers := removeDuplicateLayers(manifest.Layers)
 
 	var doneChans []chan error
@@ -140,22 +143,31 @@ func (of *OCIFetcher) Fetch(u *URL, outputDir string) error {
 	of.debugMsg("layers successfully retrieved")
 
 	// Write the required oci-layout file
-	err = writeJSONToFile(path.Join(outputDir, "oci-layout"), schema.DefaultOCILayout)
+	err = writeJSONToFile(filepath.Join(outputDir, "oci-layout"), schema.DefaultOCILayout)
 	if err != nil {
 		return err
 	}
 
-	// Write the manifest into the refs folder
-	err = writeJSONToFile(path.Join(refsDir(outputDir), u.Version), manifest)
+	// Write the manifest blob
+	if err := ioutil.WriteFile(blobFile(outputDir, manifestData.digest), manifestData.blob, 0644); err != nil {
+		return err
+	}
+
+	// Write the config blob
+	if err := ioutil.WriteFile(blobFile(outputDir, manifest.Config.Digest), configData.blob, 0644); err != nil {
+		return err
+	}
+	// Write the descriptor into the refs folder
+	descriptor := schema.Descriptor{
+		MediaType: schema.MediaTypeManifest,
+		Digest:    manifestData.digest,
+		Size:      manifestData.size,
+	}
+	err = writeJSONToFile(path.Join(refsDir(outputDir), u.Version), descriptor)
 	if err != nil {
 		return err
 	}
 
-	// Write the config into the blobs folder
-	err = writeJSONToFile(blobFile(outputDir, manifest.Config.Digest), config)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -183,7 +195,14 @@ func writeJSONToFile(path string, data interface{}) error {
 	return ioutil.WriteFile(path, blob, 0644)
 }
 
-func (of *OCIFetcher) fetchManifest(u *URL) (*schema.ImageManifest, error) {
+type manifestData struct {
+	manifest *schema.ImageManifest
+	blob     []byte
+	digest   string
+	size     int
+}
+
+func (of *OCIFetcher) fetchManifest(u *URL, outputDir string) (*manifestData, error) {
 	stringURL := "https://" + path.Join(u.Host, "v2", u.Name, "manifests", u.Version)
 
 	req, err := http.NewRequest("GET", stringURL, nil)
@@ -203,6 +222,11 @@ func (of *OCIFetcher) fetchManifest(u *URL) (*schema.ImageManifest, error) {
 		return nil, fmt.Errorf("unexpected http code: %d, URL: %s", res.StatusCode, req.URL)
 	}
 
+	digest := res.Header.Get("Docker-Content-Digest")
+	if digest == "" {
+		return nil, fmt.Errorf("response headers doesn't contain manifest digest")
+	}
+
 	manblob, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
@@ -215,10 +239,21 @@ func (of *OCIFetcher) fetchManifest(u *URL) (*schema.ImageManifest, error) {
 		return nil, err
 	}
 
-	return manifest, manifest.Validate()
+	manifestData := manifestData{
+		manifest: manifest,
+		blob:     manblob,
+		digest:   digest,
+		size:     len(manblob),
+	}
+	return &manifestData, manifest.Validate()
 }
 
-func (of *OCIFetcher) fetchConfig(u *URL, configDigest string, expectedSize int) (*schema.ImageConfig, error) {
+type configData struct {
+	config *schema.ImageConfig
+	blob   []byte
+}
+
+func (of *OCIFetcher) fetchConfig(u *URL, configDigest string, expectedSize int, outputDir string) (*configData, error) {
 	stringURL := "https://" + path.Join(u.Host, "v2", u.Name, "blobs", configDigest)
 
 	req, err := http.NewRequest("GET", stringURL, nil)
@@ -254,8 +289,9 @@ func (of *OCIFetcher) fetchConfig(u *URL, configDigest string, expectedSize int)
 		return nil, err
 	}
 
-	return config, nil
+	return &configData{config: config, blob: confblob}, nil
 }
+
 func (of *OCIFetcher) fetchLayer(u *URL, layerDigest string, expectedSize int, outputDir string, cpp *progressutil.CopyProgressPrinter) ([]io.Closer, error) {
 	stringURL := "https://" + path.Join(u.Host, "v2", u.Name, "blobs", layerDigest)
 

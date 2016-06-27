@@ -22,7 +22,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -113,7 +112,11 @@ func newWalkFn(parentDir string, tw *tar.Writer) filepath.WalkFunc {
 		if err != nil {
 			return err
 		}
-		h.Name = strings.TrimPrefix(path, parentDir)
+		h.Name, err = filepath.Rel(parentDir, path)
+		if err != nil {
+			return err
+		}
+
 		err = tw.WriteHeader(h)
 		if err != nil {
 			return err
